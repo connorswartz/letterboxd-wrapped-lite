@@ -6,10 +6,11 @@ from typing import Optional
 from sqlmodel import Session
 
 from ..services.rss_ingestion import RSSIngestionService, LetterboxdRSSError
-from ..models import SessionResponse, SessionStatus, ProcessingSession, DiaryEntry
+from ..models import SessionResponse, SessionStatus, ProcessingSession, DiaryEntry, MovieDetails
 from ..database import get_session
 import logging
 from datetime import datetime
+import json
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -145,8 +146,9 @@ async def get_ingestion_status(
 
 # Background task functions
 async def process_rss_data(session_id: str, username: str):
-    """Background task to process RSS data"""
+    """Background task to process RSS data with TMDB enrichment"""
     from sqlmodel import create_engine, Session
+    from ..services.tmdb_service import TMDBService
     import os
     
     # Create a new database session for the background task
@@ -155,6 +157,7 @@ async def process_rss_data(session_id: str, username: str):
     
     with Session(engine) as db:
         rss_service = RSSIngestionService()
+        tmdb_service = TMDBService()
         
         try:
             # Get the session
@@ -173,12 +176,15 @@ async def process_rss_data(session_id: str, username: str):
             logger.info(f"Fetching RSS data for {username}")
             entries = await rss_service.fetch_user_diary(username)
             
-            session.progress = 50
+            session.progress = 30
             db.commit()
             
-            # Store entries in database
-            logger.info(f"Storing {len(entries)} entries for {username}")
-            for entry_data in entries:
+            # Store entries in database with TMDB enrichment
+            logger.info(f"Processing {len(entries)} entries with TMDB enrichment")
+            total_entries = len(entries)
+            
+            for i, entry_data in enumerate(entries):
+                # Create diary entry
                 diary_entry = DiaryEntry(
                     session_id=session_id,
                     title=entry_data["title"],
@@ -188,10 +194,46 @@ async def process_rss_data(session_id: str, username: str):
                     review_text=entry_data["review_text"],
                     is_rewatch=entry_data["is_rewatch"]
                 )
+                
+                # Try TMDB enrichment
+                tmdb_data = await tmdb_service.search_movie(entry_data["title"], entry_data["year"])
+                if tmdb_data:
+                    tmdb_id = tmdb_data.get("id")
+                    diary_entry.tmdb_id = tmdb_id
+                    diary_entry.tmdb_enriched = True
+                    
+                    # Check if MovieDetails already exists
+                    existing_movie = db.query(MovieDetails).filter(
+                        MovieDetails.tmdb_id == tmdb_id
+                    ).first()
+                    
+                    if not existing_movie:
+                        # Create new MovieDetails record
+                        movie_details = MovieDetails(
+                            tmdb_id=tmdb_id,
+                            title=tmdb_data.get("title", entry_data["title"]),
+                            year=int(tmdb_data.get("release_date", "")[:4]) if tmdb_data.get("release_date") else entry_data["year"],
+                            runtime_minutes=tmdb_data.get("runtime"),  # Will be None for search results
+                            genres=json.dumps(tmdb_data.get("genre_ids", [])),  # Store as JSON
+                            director=None,  # Search results don't include director
+                            top_cast=json.dumps([]),  # Search results don't include cast
+                            overview=tmdb_data.get("overview"),
+                            poster_path=tmdb_data.get("poster_path")
+                        )
+                        db.add(movie_details)
+                        logger.info(f"Created MovieDetails for '{entry_data['title']}' (TMDB ID: {tmdb_id})")
+                    
+                    logger.info(f"Enriched '{entry_data['title']}' with TMDB ID {tmdb_id}")
+                else:
+                    diary_entry.tmdb_failed = True
+                    logger.warning(f"No TMDB match for '{entry_data['title']}' ({entry_data['year']})")
+                
                 db.add(diary_entry)
-            
-            session.progress = 90
-            db.commit()
+                
+                # Update progress
+                progress = 30 + int((i + 1) / total_entries * 60)  # 30-90% range
+                session.progress = progress
+                db.commit()
             
             # Update session status to completed
             session.status = SessionStatus.COMPLETED
@@ -202,7 +244,6 @@ async def process_rss_data(session_id: str, username: str):
             logger.info(f"Successfully processed {len(entries)} entries for {username}")
             
         except LetterboxdRSSError as e:
-            # Update session status to failed
             logger.error(f"RSS error for {username}: {str(e)}")
             session = db.query(ProcessingSession).filter(
                 ProcessingSession.session_id == session_id
@@ -213,7 +254,6 @@ async def process_rss_data(session_id: str, username: str):
                 db.commit()
         
         except Exception as e:
-            # Update session status to failed
             logger.error(f"Unexpected error processing {username}: {str(e)}")
             session = db.query(ProcessingSession).filter(
                 ProcessingSession.session_id == session_id
@@ -225,6 +265,7 @@ async def process_rss_data(session_id: str, username: str):
         
         finally:
             await rss_service.close()
+            await tmdb_service.close()
 
 async def process_csv_data(session_id: str, csv_data: str):
     """Background task to process CSV data"""

@@ -1,10 +1,8 @@
-# app/routers/stats.py
 from fastapi import APIRouter, HTTPException, Depends
 from sqlmodel import Session, select
-from typing import List
-
-from ..models import StatsResponse, ProcessingSession, DiaryEntry, SessionStatus
+from ..models import StatsResponse, ProcessingSession, DiaryEntry, MovieDetails, SessionStatus
 from ..database import get_session
+from ..services.stats_service import StatsService
 
 router = APIRouter()
 
@@ -26,34 +24,28 @@ async def get_stats(session_id: str, db: Session = Depends(get_session)):
             detail=f"Session not completed. Status: {session.status}"
         )
     
-    # Get diary entries for this session
+    # Get diary entries for this session WITH movie details relationship loaded
     entries = db.query(DiaryEntry).filter(
         DiaryEntry.session_id == session_id
     ).all()
     
+    # Manually load movie details for enriched entries
+    for entry in entries:
+        if entry.tmdb_id:
+            entry.movie_details = db.query(MovieDetails).filter(
+                MovieDetails.tmdb_id == entry.tmdb_id
+            ).first()
+    
     if not entries:
         raise HTTPException(status_code=404, detail="No diary entries found")
     
-    # Compute basic statistics
-    total_films = len(entries)
-    rated_entries = [e for e in entries if e.rating is not None]
-    average_rating = sum(e.rating for e in rated_entries) / len(rated_entries) if rated_entries else None
-    
-    # Compute top genres, directors (simplified for now)
-    years = [e.year for e in entries if e.year is not None]
-    top_years = list(set(years))[:5]  # Top 5 unique years
-    
-    # TODO: Implement more sophisticated stats once we have TMDB enrichment
-    top_genres = ["Drama", "Action"]  # Placeholder
-    top_directors = ["Christopher Nolan", "Martin Scorsese"]  # Placeholder
+    # Compute statistics using service with database session
+    stats_service = StatsService(db)
+    computed_stats = stats_service.compute_user_stats(entries)
     
     return StatsResponse(
         session_id=session_id,
-        total_films=total_films,
-        total_hours=0.0,  # TODO: Calculate from TMDB runtime data
-        average_rating=average_rating,
-        top_genres=top_genres,
-        top_directors=top_directors
+        **computed_stats
     )
 
 @router.get("/{session_id}/card")

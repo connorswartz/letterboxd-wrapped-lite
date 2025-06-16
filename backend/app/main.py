@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import os
 import logging
+from typing import Optional
 from dotenv import load_dotenv
 
 from .database import init_db
@@ -274,6 +275,28 @@ async def debug_rss(username: str):
             
     except Exception as e:
         return {"error": str(e)}
+
+@app.get("/test-tmdb/{title}")
+async def test_tmdb(title: str, year: Optional[int] = None):
+    """Test TMDB movie search"""
+    from .services.tmdb_service import TMDBService
+    
+    service = TMDBService()
+    try:
+        result = await service.search_movie(title, year)
+        return {
+            "success": True,
+            "title": title,
+            "year": year,
+            "tmdb_result": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+    finally:
+        await service.close()
 
 if __name__ == "__main__":
     import uvicorn
